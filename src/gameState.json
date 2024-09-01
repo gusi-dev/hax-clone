@@ -1,0 +1,73 @@
+{
+  "nested": {
+    "Vector2D": {
+      "fields": {
+        "x": {
+          "type": "float",
+          "id": 1
+        },
+        "y": {
+          "type": "float",
+          "id": 2
+        }
+      }
+    },
+    "GameObject": {
+      "fields": {
+        "position": {
+          "type": "Vector2D",
+          "id": 1
+        },
+        "velocity": {
+          "type": "Vector2D",
+          "id": 2
+        },
+        "radius": {
+          "type": "float",
+          "id": 3
+        }
+      }
+    },
+    "Player": {
+      "fields": {
+        "object": {
+          "type": "GameObject",
+          "id": 1
+        },
+        "team": {
+          "type": "string",
+          "id": 2
+        }
+      }
+    },
+    "Score": {
+      "fields": {
+        "red": {
+          "type": "int32",
+          "id": 1
+        },
+        "blue": {
+          "type": "int32",
+          "id": 2
+        }
+      }
+    },
+    "GameState": {
+      "fields": {
+        "players": {
+          "keyType": "string",
+          "type": "Player",
+          "id": 1
+        },
+        "ball": {
+          "type": "GameObject",
+          "id": 2
+        },
+        "score": {
+          "type": "Score",
+          "id": 3
+        }
+      }
+    }
+  }
+}

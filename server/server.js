@@ -1,26 +1,21 @@
-const express = require('express')
-const http = require('http')
 const WebSocket = require('ws')
+const http = require('http')
+const protobuf = require('protobufjs')
+const path = require('path')
 
-const app = express()
-const server = http.createServer(app)
+const server = http.createServer()
 const wss = new WebSocket.Server({ server })
 
 const FIELD_WIDTH = 800
 const FIELD_HEIGHT = 400
 const PLAYER_RADIUS = 20
 const BALL_RADIUS = 15
-const GOAL_WIDTH = 100
-const GOAL_HEIGHT = 150
-const PLAYER_SPEED = 0.5 // Increased from 0.0016
+const PLAYER_SPEED = 0.1
 const FRICTION = 0.98
 const BALL_WEIGHT = 0.2
 const KICK_POWER = 2
 const MAX_BALL_SPEED = 10
 const BALL_PLAYER_RESTITUTION = 0.3
-const BALL_STICKINESS = 0.1
-const BALL_TOUCH_POWER = 1
-const BALL_KICK_POWER = 2
 
 let gameState = {
   players: {},
@@ -34,18 +29,15 @@ let gameState = {
   score: { red: 0, blue: 0 }
 }
 
-function updateGameState (deltaTime) {
-  // Update player positions based on input
-  Object.values(gameState.players).forEach(player => {
-    if (player.input.has('w') || player.input.has('arrowup'))
-      player.vy -= PLAYER_SPEED
-    if (player.input.has('s') || player.input.has('arrowdown'))
-      player.vy += PLAYER_SPEED
-    if (player.input.has('a') || player.input.has('arrowleft'))
-      player.vx -= PLAYER_SPEED
-    if (player.input.has('d') || player.input.has('arrowright'))
-      player.vx += PLAYER_SPEED
+let lastSentState = JSON.parse(JSON.stringify(gameState))
 
+// Load the Protocol Buffer schema
+const root = protobuf.loadSync(path.join(__dirname, '../src/gameState.json'))
+const GameState = root.lookupType('GameState')
+
+function updateGameState (deltaTime) {
+  // Update player positions
+  Object.values(gameState.players).forEach(player => {
     player.x += player.vx * deltaTime
     player.y += player.vy * deltaTime
 
@@ -93,14 +85,6 @@ function updateGameState (deltaTime) {
   // Apply friction to ball
   gameState.ball.vx *= FRICTION
   gameState.ball.vy *= FRICTION
-
-  // Limit ball speed
-  const ballSpeed = Math.sqrt(gameState.ball.vx ** 2 + gameState.ball.vy ** 2)
-  if (ballSpeed > MAX_BALL_SPEED) {
-    const factor = MAX_BALL_SPEED / ballSpeed
-    gameState.ball.vx *= factor
-    gameState.ball.vy *= factor
-  }
 
   // Check for collisions
   checkCollisions()
@@ -164,6 +148,48 @@ function resetBall () {
   }
 }
 
+function broadcastGameState () {
+  // Convert the full gameState to the format expected by Protocol Buffers
+  const protoGameState = {
+    players: Object.entries(gameState.players).reduce((acc, [id, player]) => {
+      acc[id] = {
+        object: {
+          position: { x: player.x, y: player.y },
+          velocity: { x: player.vx, y: player.vy },
+          radius: player.radius
+        },
+        team: player.team
+      }
+      return acc
+    }, {}),
+    ball: {
+      position: { x: gameState.ball.x, y: gameState.ball.y },
+      velocity: { x: gameState.ball.vx, y: gameState.ball.vy },
+      radius: gameState.ball.radius
+    },
+    score: gameState.score
+  }
+
+  console.log('Sending state:', protoGameState) // Add this line for debugging
+
+  const message = GameState.create(protoGameState)
+  const buffer = GameState.encode(message).finish()
+
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(buffer)
+    }
+  })
+
+  lastSentState = JSON.parse(JSON.stringify(gameState))
+}
+
+function computeDelta (currentState, lastState) {
+  // For simplicity, we'll always return the full state
+  // This ensures that all clients always have the most up-to-date information
+  return currentState
+}
+
 wss.on('connection', ws => {
   const playerId = Date.now().toString()
   const team = Object.keys(gameState.players).length % 2 === 0 ? 'red' : 'blue'
@@ -175,7 +201,7 @@ wss.on('connection', ws => {
     vy: 0,
     radius: PLAYER_RADIUS,
     team,
-    input: new Set()
+    input: new Set() // Add this to track player input
   }
 
   ws.on('message', message => {
@@ -190,26 +216,41 @@ wss.on('connection', ws => {
   })
 })
 
-function broadcastGameState () {
-  wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify(gameState))
-    }
+function updateGameState (deltaTime) {
+  // Update player positions based on their inputs
+  Object.values(gameState.players).forEach(player => {
+    player.vx = 0
+    player.vy = 0
+    if (player.input.has('w') || player.input.has('arrowup'))
+      player.vy -= PLAYER_SPEED
+    if (player.input.has('s') || player.input.has('arrowdown'))
+      player.vy += PLAYER_SPEED
+    if (player.input.has('a') || player.input.has('arrowleft'))
+      player.vx -= PLAYER_SPEED
+    if (player.input.has('d') || player.input.has('arrowright'))
+      player.vx += PLAYER_SPEED
+
+    player.x += player.vx * deltaTime
+    player.y += player.vy * deltaTime
+
+    // Apply boundary checks
+    player.x = Math.max(
+      PLAYER_RADIUS,
+      Math.min(FIELD_WIDTH - PLAYER_RADIUS, player.x)
+    )
+    player.y = Math.max(
+      PLAYER_RADIUS,
+      Math.min(FIELD_HEIGHT - PLAYER_RADIUS, player.y)
+    )
   })
 }
 
-const FPS = 30 // Reduced from 60
+const FPS = 30
 setInterval(() => {
   updateGameState(1000 / FPS)
   broadcastGameState()
 }, 1000 / FPS)
 
-// Express route for the root path
-app.get('/', (req, res) => {
-  res.send('Haxball server is running!')
-})
-
-const PORT = process.env.PORT || 8080
-server.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`)
+server.listen(8080, () => {
+  console.log('Server is listening on port 8080')
 })

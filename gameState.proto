@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+message Vector2D {
+  float x = 1;
+  float y = 2;
+}
+
+message GameObject {
+  Vector2D position = 1;
+  Vector2D velocity = 2;
+  float radius = 3;
+}
+
+message Player {
+  GameObject object = 1;
+  string team = 2;
+}
+
+message Score {
+  int32 red = 1;
+  int32 blue = 2;
+}
+
+message GameState {
+  map<string, Player> players = 1;
+  GameObject ball = 2;
+  Score score = 3;
+}

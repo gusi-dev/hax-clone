@@ -2,6 +2,8 @@
 
 import React, { useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
+import * as protobuf from 'protobufjs'
+import gameStateJSON from '../gameState.json'
 
 const FIELD_WIDTH = 800
 const FIELD_HEIGHT = 400
@@ -27,6 +29,10 @@ interface GameState {
   score: { red: number; blue: number }
 }
 
+// Load the Protocol Buffer schema
+const root = protobuf.Root.fromJSON(gameStateJSON)
+const GameState = root.lookupType('GameState')
+
 export function HaxballGame () {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [gameState, setGameState] = useState<GameState>({
@@ -41,9 +47,8 @@ export function HaxballGame () {
     score: { red: 0, blue: 0 }
   })
   const wsRef = useRef<WebSocket | null>(null)
+  const playerIdRef = useRef<string | null>(null)
   const keysPressed = useRef<Set<string>>(new Set())
-  const lastUpdateTime = useRef<number>(Date.now())
-  const interpolatedState = useRef<GameState>(gameState)
 
   useEffect(() => {
     wsRef.current = new WebSocket('ws://localhost:8080')
@@ -52,13 +57,49 @@ export function HaxballGame () {
       console.log('Connected to server')
     }
 
-    wsRef.current.onmessage = event => {
-      const newGameState: GameState = JSON.parse(event.data)
-      setGameState(prevState => {
-        interpolatedState.current = { ...prevState }
-        lastUpdateTime.current = Date.now()
-        return newGameState
-      })
+    wsRef.current.onmessage = async event => {
+      const arrayBuffer = await event.data.arrayBuffer()
+      const buffer = new Uint8Array(arrayBuffer)
+
+      try {
+        const decodedMessage = GameState.decode(buffer)
+        const receivedState = GameState.toObject(decodedMessage, {
+          longs: String,
+          enums: String,
+          bytes: String
+        })
+
+        console.log('Received state:', receivedState)
+
+        setGameState({
+          players: Object.entries(receivedState.players || {}).reduce(
+            (acc, [id, player]) => {
+              acc[id] = {
+                x: player.object.position.x,
+                y: player.object.position.y,
+                vx: player.object.velocity.x,
+                vy: player.object.velocity.y,
+                radius: player.object.radius,
+                team: player.team
+              }
+              return acc
+            },
+            {}
+          ),
+          ball: receivedState.ball
+            ? {
+                x: receivedState.ball.position.x,
+                y: receivedState.ball.position.y,
+                vx: receivedState.ball.velocity.x,
+                vy: receivedState.ball.velocity.y,
+                radius: receivedState.ball.radius
+              }
+            : gameState.ball,
+          score: receivedState.score || gameState.score
+        })
+      } catch (error) {
+        console.error('Error decoding message:', error)
+      }
     }
 
     wsRef.current.onclose = () => {
@@ -109,22 +150,6 @@ export function HaxballGame () {
     if (!ctx) return
 
     const drawGame = () => {
-      const now = Date.now()
-      const delta = (now - lastUpdateTime.current) / (1000 / 30) // Assuming 30 FPS server updates
-
-      // Interpolate game state
-      Object.entries(gameState.players).forEach(([id, player]) => {
-        if (!interpolatedState.current.players[id]) {
-          interpolatedState.current.players[id] = { ...player }
-        } else {
-          interpolatedState.current.players[id].x += player.vx * delta
-          interpolatedState.current.players[id].y += player.vy * delta
-        }
-      })
-
-      interpolatedState.current.ball.x += gameState.ball.vx * delta
-      interpolatedState.current.ball.y += gameState.ball.vy * delta
-
       // Clear and fill the entire canvas with green
       ctx.fillStyle = '#4CAF50'
       ctx.fillRect(0, 0, EXTENDED_FIELD_WIDTH, EXTENDED_FIELD_HEIGHT)
@@ -186,8 +211,8 @@ export function HaxballGame () {
       )
       ctx.stroke()
 
-      // Draw players using interpolated state
-      Object.values(interpolatedState.current.players).forEach(player => {
+      // Draw players
+      Object.entries(gameState.players).forEach(([id, player]) => {
         ctx.fillStyle = player.team === 'red' ? 'red' : 'blue'
         ctx.beginPath()
         ctx.arc(
@@ -200,12 +225,12 @@ export function HaxballGame () {
         ctx.fill()
       })
 
-      // Draw ball using interpolated state
+      // Draw ball
       ctx.fillStyle = 'white'
       ctx.beginPath()
       ctx.arc(
-        interpolatedState.current.ball.x + PLAYER_RADIUS,
-        interpolatedState.current.ball.y + PLAYER_RADIUS,
+        gameState.ball.x + PLAYER_RADIUS,
+        gameState.ball.y + PLAYER_RADIUS,
         BALL_RADIUS,
         0,
         Math.PI * 2
