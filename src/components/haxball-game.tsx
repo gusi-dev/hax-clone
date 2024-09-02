@@ -33,6 +33,14 @@ interface GameState {
 const root = protobuf.Root.fromJSON(gameStateJSON)
 const GameState = root.lookupType('GameState')
 
+const FPS = 60
+const INTERPOLATION_DELAY = 100 // ms
+
+interface InterpolatedGameState extends GameState {
+  lastUpdateTime: number
+  serverTime: number
+}
+
 export function HaxballGame () {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [gameState, setGameState] = useState<GameState>({
@@ -46,70 +54,164 @@ export function HaxballGame () {
     },
     score: { red: 0, blue: 0 }
   })
+  const [interpolatedState, setInterpolatedState] =
+    useState<InterpolatedGameState>({
+      players: {},
+      ball: {
+        x: FIELD_WIDTH / 2,
+        y: FIELD_HEIGHT / 2,
+        vx: 0,
+        vy: 0,
+        radius: BALL_RADIUS
+      },
+      score: { red: 0, blue: 0 },
+      lastUpdateTime: Date.now(),
+      serverTime: Date.now()
+    })
   const wsRef = useRef<WebSocket | null>(null)
   const playerIdRef = useRef<string | null>(null)
   const keysPressed = useRef<Set<string>>(new Set())
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null)
+  const dataChannelRef = useRef<RTCDataChannel | null>(null)
+  const [serverTimeOffset, setServerTimeOffset] = useState(0)
 
   useEffect(() => {
-    wsRef.current = new WebSocket('ws://localhost:8080')
+    const ws = new WebSocket('ws://localhost:8080')
+    wsRef.current = ws
 
-    wsRef.current.onopen = () => {
-      console.log('Connected to server')
+    ws.onopen = async () => {
+      console.log('Connected to signaling server')
+      await setupWebRTC()
     }
 
-    wsRef.current.onmessage = async event => {
-      const arrayBuffer = await event.data.arrayBuffer()
-      const buffer = new Uint8Array(arrayBuffer)
+    ws.onmessage = async event => {
+      const data = JSON.parse(event.data)
 
-      try {
-        const decodedMessage = GameState.decode(buffer)
-        const receivedState = GameState.toObject(decodedMessage, {
-          longs: String,
-          enums: String,
-          bytes: String
-        })
-
-        console.log('Received state:', receivedState)
-
-        setGameState({
-          players: Object.entries(receivedState.players || {}).reduce(
-            (acc, [id, player]) => {
-              acc[id] = {
-                x: player.object.position.x,
-                y: player.object.position.y,
-                vx: player.object.velocity.x,
-                vy: player.object.velocity.y,
-                radius: player.object.radius,
-                team: player.team
-              }
-              return acc
-            },
-            {}
-          ),
-          ball: receivedState.ball
-            ? {
-                x: receivedState.ball.position.x,
-                y: receivedState.ball.position.y,
-                vx: receivedState.ball.velocity.x,
-                vy: receivedState.ball.velocity.y,
-                radius: receivedState.ball.radius
-              }
-            : gameState.ball,
-          score: receivedState.score || gameState.score
-        })
-      } catch (error) {
-        console.error('Error decoding message:', error)
+      if (data.type === 'offer') {
+        await handleOffer(data.offer)
+      } else if (data.type === 'answer') {
+        await peerConnectionRef.current?.setRemoteDescription(
+          new RTCSessionDescription(data.answer)
+        )
+      } else if (data.type === 'ice-candidate') {
+        await peerConnectionRef.current?.addIceCandidate(data.candidate)
       }
     }
 
-    wsRef.current.onclose = () => {
-      console.log('Disconnected from server')
-    }
-
     return () => {
-      wsRef.current?.close()
+      ws.close()
+      peerConnectionRef.current?.close()
     }
   }, [])
+
+  const setupWebRTC = async () => {
+    const peerConnection = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    })
+    peerConnectionRef.current = peerConnection
+
+    peerConnection.onicecandidate = event => {
+      if (event.candidate) {
+        wsRef.current?.send(
+          JSON.stringify({ type: 'ice-candidate', candidate: event.candidate })
+        )
+      }
+    }
+
+    const dataChannel = peerConnection.createDataChannel('gameState')
+    dataChannelRef.current = dataChannel
+
+    dataChannel.onopen = () => console.log('Data channel open')
+    dataChannel.onclose = () => console.log('Data channel closed')
+    dataChannel.onmessage = handleGameStateUpdate
+
+    const offer = await peerConnection.createOffer()
+    await peerConnection.setLocalDescription(offer)
+    wsRef.current?.send(JSON.stringify({ type: 'offer', offer }))
+  }
+
+  const handleOffer = async (offer: RTCSessionDescriptionInit) => {
+    await peerConnectionRef.current?.setRemoteDescription(
+      new RTCSessionDescription(offer)
+    )
+    const answer = await peerConnectionRef.current?.createAnswer()
+    await peerConnectionRef.current?.setLocalDescription(answer)
+    wsRef.current?.send(JSON.stringify({ type: 'answer', answer }))
+  }
+
+  const handleGameStateUpdate = async (event: MessageEvent) => {
+    let buffer: Uint8Array
+
+    if (event.data instanceof ArrayBuffer) {
+      buffer = new Uint8Array(event.data)
+    } else if (event.data instanceof Blob) {
+      const arrayBuffer = await event.data.arrayBuffer()
+      buffer = new Uint8Array(arrayBuffer)
+    } else if (typeof event.data === 'string') {
+      try {
+        const parsedData = JSON.parse(event.data)
+        console.log('Received JSON data:', parsedData)
+        // Handle JSON data if needed
+        return
+      } catch (error) {
+        console.error('Error parsing JSON:', error)
+        return
+      }
+    } else {
+      console.error('Unsupported data type:', typeof event.data)
+      return
+    }
+
+    try {
+      const decodedMessage = GameState.decode(buffer)
+      const receivedState = GameState.toObject(decodedMessage, {
+        longs: String,
+        enums: String,
+        bytes: String
+      })
+
+      const serverTime = receivedState.timestamp
+      const clientTime = Date.now()
+      const newOffset = serverTime - clientTime
+      setServerTimeOffset(prevOffset => (prevOffset + newOffset) / 2)
+
+      const newGameState: GameState = {
+        players: Object.entries(receivedState.players || {}).reduce(
+          (acc, [id, player]) => {
+            acc[id] = {
+              x: player.object.position.x,
+              y: player.object.position.y,
+              vx: player.object.velocity.x,
+              vy: player.object.velocity.y,
+              radius: player.object.radius,
+              team: player.team
+            }
+            return acc
+          },
+          {}
+        ),
+        ball: receivedState.ball
+          ? {
+              x: receivedState.ball.position.x,
+              y: receivedState.ball.position.y,
+              vx: receivedState.ball.velocity.x,
+              vy: receivedState.ball.velocity.y,
+              radius: receivedState.ball.radius
+            }
+          : gameState.ball,
+        score: receivedState.score || gameState.score
+      }
+
+      setGameState(newGameState)
+      setInterpolatedState(prevState => ({
+        ...newGameState,
+        lastUpdateTime: Date.now(),
+        serverTime: serverTime
+      }))
+    } catch (error) {
+      console.error('Error decoding message:', error)
+    }
+  }
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -132,8 +234,8 @@ export function HaxballGame () {
   }, [])
 
   const sendInputToServer = () => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
+    if (dataChannelRef.current?.readyState === 'open') {
+      dataChannelRef.current.send(
         JSON.stringify({
           type: 'input',
           input: Array.from(keysPressed.current)
@@ -141,6 +243,71 @@ export function HaxballGame () {
       )
     }
   }
+
+  useEffect(() => {
+    let animationFrameId: number
+
+    const interpolate = () => {
+      const now = Date.now()
+      const serverNow = now + serverTimeOffset
+      const renderTimestamp = serverNow - INTERPOLATION_DELAY
+
+      const timeSinceLastUpdate = renderTimestamp - interpolatedState.serverTime
+      const interpolationFactor = Math.min(
+        timeSinceLastUpdate / (1000 / FPS),
+        1
+      )
+
+      const newInterpolatedState = {
+        players: Object.entries(gameState.players).reduce(
+          (acc, [id, player]) => {
+            const prevPlayer = interpolatedState.players[id]
+            if (prevPlayer) {
+              acc[id] = {
+                x:
+                  prevPlayer.x +
+                  (player.x - prevPlayer.x) * interpolationFactor,
+                y:
+                  prevPlayer.y +
+                  (player.y - prevPlayer.y) * interpolationFactor,
+                vx: player.vx,
+                vy: player.vy,
+                radius: player.radius,
+                team: player.team
+              }
+            } else {
+              acc[id] = player
+            }
+            return acc
+          },
+          {}
+        ),
+        ball: {
+          x:
+            interpolatedState.ball.x +
+            (gameState.ball.x - interpolatedState.ball.x) * interpolationFactor,
+          y:
+            interpolatedState.ball.y +
+            (gameState.ball.y - interpolatedState.ball.y) * interpolationFactor,
+          vx: gameState.ball.vx,
+          vy: gameState.ball.vy,
+          radius: gameState.ball.radius
+        },
+        score: gameState.score,
+        lastUpdateTime: interpolatedState.lastUpdateTime,
+        serverTime: interpolatedState.serverTime
+      }
+
+      setInterpolatedState(newInterpolatedState)
+      animationFrameId = requestAnimationFrame(interpolate)
+    }
+
+    animationFrameId = requestAnimationFrame(interpolate)
+
+    return () => {
+      cancelAnimationFrame(animationFrameId)
+    }
+  }, [gameState, interpolatedState, serverTimeOffset])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -212,7 +379,7 @@ export function HaxballGame () {
       ctx.stroke()
 
       // Draw players
-      Object.entries(gameState.players).forEach(([id, player]) => {
+      Object.entries(interpolatedState.players).forEach(([id, player]) => {
         ctx.fillStyle = player.team === 'red' ? 'red' : 'blue'
         ctx.beginPath()
         ctx.arc(
@@ -229,8 +396,8 @@ export function HaxballGame () {
       ctx.fillStyle = 'white'
       ctx.beginPath()
       ctx.arc(
-        gameState.ball.x + PLAYER_RADIUS,
-        gameState.ball.y + PLAYER_RADIUS,
+        interpolatedState.ball.x + PLAYER_RADIUS,
+        interpolatedState.ball.y + PLAYER_RADIUS,
         BALL_RADIUS,
         0,
         Math.PI * 2
@@ -244,7 +411,7 @@ export function HaxballGame () {
     }
 
     gameLoop()
-  }, [gameState])
+  }, [interpolatedState])
 
   return (
     <div className='flex flex-col items-center justify-center min-h-screen bg-gray-100'>
